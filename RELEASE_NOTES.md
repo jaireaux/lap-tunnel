@@ -1,0 +1,18 @@
+# 0.1.0 release candidate
+
+Named, loopback-only macOS SSH tunnels with per-user LaunchAgents, persistent
+stop/start controls, validated definitions, diagnostics, bounded logs and
+ownership-checked CLI installation/upgrades.
+
+Requirements: macOS 14+ intended target, Python 3.11–3.14, existing trusted SSH
+access. See README for actual tested versions and migration instructions.
+Existing personal installations are never upgraded or migrated automatically.
+
+21 unit tests pass locally on macOS 26.6.2 / Python 3.14.6. Real launchd bootstrap
+was blocked/failed in the restricted development session (error 5); this is not
+a passed live lifecycle test. Actual SSH forwarding, login/reboot and sleep/wake
+remain unverified for this generalized version. See docs/verification.md.
+
+**Draft only: owner must choose a license before public publication.**
+No open-source license is granted by this candidate. Release assets are raw
+source files; obtain both lap-tunnel and install.py together, or use a checkout.

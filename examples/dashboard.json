@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "dashboard",
+  "ssh_host": "dev-server",
+  "local_port": 18080,
+  "remote_host": "127.0.0.1",
+  "remote_port": 8080,
+  "bind": "127.0.0.1"
+}

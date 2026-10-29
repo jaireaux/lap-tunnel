@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+# lap-tunnel managed executable v1
+"""Named, loopback-only SSH tunnels managed by macOS LaunchAgents."""
+import argparse
+from collections import deque
+from contextlib import contextmanager
+import fcntl
+import ipaddress
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import plistlib
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+
+VERSION = '0.1.0'
+PREFIX = 'org.lap-tunnel.v1.'
+MARKER = 'lap-tunnel/1'
+NAME = re.compile(r'[a-z][a-z0-9-]{0,47}\Z')
+HOST = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}\Z')
+FIELDS = {'schema', 'name', 'ssh_host', 'local_port', 'remote_host', 'remote_port', 'bind'}
+
+
+class Error(Exception):
+    pass
+
+
+def validate(d):
+    if not isinstance(d, dict) or set(d) != FIELDS:
+        raise Error('Definition must contain exactly: ' + ', '.join(sorted(FIELDS)))
+    if type(d['schema']) is not int or d['schema'] != 1:
+        raise Error('Unsupported definition schema; expected 1')
+    if not isinstance(d['name'], str) or not NAME.fullmatch(d['name']):
+        raise Error('Name: lowercase letter, then lowercase letters/digits/hyphens; max 48')
+    for key in ('local_port', 'remote_port'):
+        low = 1024 if key == 'local_port' else 1
+        if type(d[key]) is not int or not low <= d[key] <= 65535:
+            raise Error(f'{key} must be an integer in {low}..65535')
+    if not isinstance(d['ssh_host'], str) or not HOST.fullmatch(d['ssh_host']):
+        raise Error('ssh_host must be an SSH config alias or hostname; no user@, options or whitespace')
+    if d['bind'] not in ('127.0.0.1', '::1'):
+        raise Error('bind must be 127.0.0.1 or ::1 (loopback only)')
+    h = d['remote_host']
+    if not isinstance(h, str):
+        raise Error('remote_host must be a hostname or IP address')
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        if not HOST.fullmatch(h):
+            raise Error('remote_host must be a hostname or IP address')
+    return d
+
+
+def endpoint(host):
+    return '[' + host + ']' if ':' in host else host
+
+
+def ssh_args(d):
+    validate(d)
+    # Command-line values take precedence over potentially unsafe SSH config defaults.
+    opts = ['BatchMode=yes', 'StrictHostKeyChecking=yes', 'ExitOnForwardFailure=yes',
+            'ConnectTimeout=10', 'ServerAliveInterval=30', 'ServerAliveCountMax=3',
+            'ControlMaster=no', 'ControlPath=none', 'ControlPersist=no',
+            'ForkAfterAuthentication=no', 'SessionType=none', 'RequestTTY=no',
+            'PermitLocalCommand=no', 'RemoteCommand=none', 'ForwardAgent=no',
+            'ForwardX11=no', 'GatewayPorts=no', 'EscapeChar=none']
+    args = ['/usr/bin/ssh', '-NT']
+    for opt in opts:
+        args += ['-o', opt]
+    args += ['-L', f"{endpoint(d['bind'])}:{d['local_port']}:{endpoint(d['remote_host'])}:{d['remote_port']}", d['ssh_host']]
+    return args
+
+
+def atomic(path, data, mode=0o600):
+    if path.is_symlink():
+        raise Error('Refusing symlink: ' + str(path))
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchmod(out.fileno(), mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def run(*args, check=False):
+    r = subprocess.run(args, text=True, capture_output=True, timeout=20)
+    if check and r.returncode:
+        raise Error(' '.join(args[:2]) + ': ' + (r.stderr.strip() or r.stdout.strip() or str(r.returncode)))
+    return r
+
+
+def check_ssh_config(d):
+    """Reject inherited forwards so all listeners remain explicit and loopback-only."""
+    r = run('/usr/bin/ssh', '-G', *ssh_args(d)[1:], check=True)
+    lines = r.stdout.splitlines()
+    forwards = [x for x in lines if x.startswith('localforward ')]
+    expected = f"localforward {endpoint(d['bind'])}:{d['local_port']} {endpoint(d['remote_host'])}:{d['remote_port']}"
+    normalized = [x.replace('[', '').replace(']', '') for x in forwards]
+    expected = expected.replace('[', '').replace(']', '')
+    if normalized != [expected] or any(x.startswith(('remoteforward ', 'dynamicforward ')) for x in lines):
+        raise Error('SSH config supplies additional/different forwards; use a dedicated alias without forwarding directives (see doctor)')
+    return r
+
+
+class Manager:
+    def __init__(self, home=None):
+        self.home = Path(home) if home is not None else Path.home()
+        self.root = self.home / 'Library/Application Support/lap-tunnel'
+        self.defs = self.root / 'tunnels'
+        self.agents = self.home / 'Library/LaunchAgents'
+        self.logs = self.home / 'Library/Logs/lap-tunnel-v1'
+        self.domain = f'gui/{os.getuid()}'
+
+    @contextmanager
+    def lock(self):
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = self.root / 'command.lock'
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    def definition(self, name):
+        if not NAME.fullmatch(name):
+            raise Error('Invalid tunnel name')
+        return self.defs / (name + '.json')
+
+    def read(self, name):
+        path = self.definition(name)
+        if path.is_symlink():
+            raise Error('Refusing symlink: ' + str(path))
+        d = validate(json.loads(path.read_text()))
+        if d['name'] != name:
+            raise Error('Definition name does not match filename')
+        return d
+
+    def names(self):
+        return sorted(p.stem for p in self.defs.glob('*.json'))
+
+    def save(self, d, edit=False):
+        validate(d)
+        p = self.definition(d['name'])
+        if p.exists() and not edit:
+            raise Error('Tunnel already exists; use edit')
+        if edit and self.loaded(d['name']).returncode == 0:
+            raise Error('Stop the tunnel before editing its definition')
+        for n in self.names():
+            other = self.read(n)
+            if n != d['name'] and (other['bind'], other['local_port']) == (d['bind'], d['local_port']):
+                raise Error('Local endpoint already defined by ' + n)
+        # A stopped plist is regenerated only on explicit start.
+        self.owned_plist(d['name'])
+        atomic(p, (json.dumps(d, indent=2) + '\n').encode())
+
+    def service(self, name):
+        self.definition(name)
+        return self.domain + '/' + PREFIX + name
+
+    def plist_path(self, name):
+        self.definition(name)
+        return self.agents / (PREFIX + name + '.plist')
+
+    def loaded(self, name):
+        return run('/bin/launchctl', 'print', self.service(name))
+
+    def owned_plist(self, name):
+        p = self.plist_path(name)
+        if p.is_symlink():
+            raise Error('Refusing symlink: ' + str(p))
+        if p.exists():
+            data = plistlib.loads(p.read_bytes())
+            if data.get('LAPTunnelOwner') != MARKER or data.get('Label') != PREFIX + name:
+                raise Error('Refusing unmanaged LaunchAgent: ' + str(p))
+            return data
+        return None
+
+    def plist(self, d):
+        return dict(Label=PREFIX + d['name'], LAPTunnelOwner=MARKER,
+                    ProgramArguments=[sys.executable, str(Path(__file__).resolve()), '_run', d['name']],
+                    RunAtLoad=True, KeepAlive=True, ThrottleInterval=30,
+                    ProcessType='Background', ExitTimeOut=10,
+                    EnvironmentVariables={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'},
+                    StandardOutPath='/dev/null', StandardErrorPath='/dev/null')
+
+    def stop(self, name):
+        self.read(name)
+        owned = self.owned_plist(name)
+        if owned is None and self.loaded(name).returncode == 0:
+            raise Error('Loaded label has no owned plist; refusing to change it')
+        run('/bin/launchctl', 'disable', self.service(name), check=True)
+        if self.loaded(name).returncode == 0:
+            run('/bin/launchctl', 'bootout', self.service(name), check=True)
+        print(name + ': stopped; login startup disabled until start/restart')
+
+    def start(self, name, restart=False):
+        d = self.read(name)
+        old = self.owned_plist(name)
+        check_ssh_config(d)
+        active = self.loaded(name).returncode == 0
+        if active:
+            if old is None:
+                raise Error('Loaded label has no owned plist; refusing to change it')
+            run('/bin/launchctl', 'enable', self.service(name), check=True)
+            if restart:
+                run('/bin/launchctl', 'kickstart', '-k', self.service(name), check=True)
+        else:
+            family = socket.AF_INET6 if d['bind'] == '::1' else socket.AF_INET
+            with socket.socket(family) as s:
+                try:
+                    s.bind((d['bind'], d['local_port']))
+                except OSError as e:
+                    raise Error(f"Local endpoint unavailable: {e}; inspect with lsof -nP -iTCP:{d['local_port']}") from e
+            atomic(self.plist_path(name), plistlib.dumps(self.plist(d)))
+            run('/bin/launchctl', 'enable', self.service(name), check=True)
+            try:
+                run('/bin/launchctl', 'bootstrap', self.domain, str(self.plist_path(name)), check=True)
+            except Error:
+                # Do not unexpectedly start a failed activation at next login.
+                run('/bin/launchctl', 'disable', self.service(name), check=True)
+                raise
+        print(name + ': enabled; connection is asynchronous; use status and logs')
+
+    def status(self, name):
+        d = self.read(name)
+        self.owned_plist(name)
+        r = self.loaded(name)
+        pid = re.search(r'^\s*pid = (\d+)', r.stdout, re.M)
+        state = 'stopped'
+        if r.returncode == 0:
+            state = 'connecting/retrying'
+            if pid:
+                # The runner is launchd's PID; SSH is its direct child.
+                children = run('/usr/bin/pgrep', '-P', pid[1]).stdout.split()
+                for child in children:
+                    listeners = run('/usr/sbin/lsof', '-nP', '-a', '-p', child,
+                                    f"-iTCP:{d['local_port']}", '-sTCP:LISTEN', '-Fn').stdout
+                    if f"n{endpoint(d['bind'])}:{d['local_port']}\n" in listeners:
+                        state = 'listening'
+        disabled = run('/bin/launchctl', 'print-disabled', self.domain, check=True).stdout
+        login = 'disabled' if re.search(r'"' + re.escape(PREFIX + name) + r'"\s*=>\s*true', disabled) else ('enabled' if self.plist_path(name).exists() else 'not installed')
+        print(f"{name}: {state}; login={login}; {endpoint(d['bind'])}:{d['local_port']}; runner PID={pid[1] if pid else '-'}")
+        if r.returncode == 0:
+            last = re.search(r'^\s*last exit code = (.+)', r.stdout, re.M)
+            if last:
+                print('  last exit: ' + last[1] + '; inspect logs if retrying')
+        return state == 'listening'
+
+    def remove(self, name):
+        self.stop(name)
+        self.plist_path(name).unlink(missing_ok=True)
+        self.definition(name).unlink()
+        print(name + ': definition removed; logs retained')
+
+    def log(self, name):
+        self.read(name)
+        return self.logs / (name + '.log')
+
+
+def runner(m, name):
+    d = m.read(name)
+    m.logs.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.umask(0o077)
+    logger = logging.getLogger('lap-tunnel')
+    logger.setLevel(logging.INFO)
+    handler = RotatingFileHandler(m.log(name), maxBytes=1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    logger.addHandler(handler)
+    logger.info('Starting SSH; tunnel=%s; version=%s', name, VERSION)
+    child = None
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        stopping = True
+        if child is not None:
+            child.terminate()
+
+    old = {s: signal.signal(s, terminate) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        try:
+            check_ssh_config(d)
+        except Error as e:
+            logger.error('%s', e)
+            return 2
+        child = subprocess.Popen(ssh_args(d), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, start_new_session=False)
+        if stopping:
+            child.terminate()
+        # Fixed-size reads bound memory even for diagnostics without newlines.
+        while chunk := os.read(child.stdout.fileno(), 4096):
+            logger.info('%s', chunk.decode('utf-8', errors='replace').rstrip())
+        code = child.wait()
+        logger.info('SSH exited: %s; launchd retries while enabled', code)
+        return 0 if stopping else (code if code > 0 else 1)
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            if child.stdout:
+                child.stdout.close()
+        for s, fn in old.items():
+            signal.signal(s, fn)
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--version', action='version', version=VERSION)
+    sub = p.add_subparsers(dest='command', required=True)
+    for cmd in ('list', 'status'):
+        q = sub.add_parser(cmd, help='show managed listener and login state (not application health)')
+        q.add_argument('name', nargs='?')
+    for cmd in ('start', 'stop', 'restart', 'remove', 'show', 'doctor', '_run'):
+        q = sub.add_parser(cmd)
+        q.add_argument('name')
+    for cmd in ('add', 'edit'):
+        q = sub.add_parser(cmd, help='create or update a stopped definition')
+        q.add_argument('name')
+        q.add_argument('--ssh-host', required=cmd == 'add')
+        q.add_argument('--local-port', type=int, required=cmd == 'add')
+        q.add_argument('--remote-port', type=int, required=cmd == 'add')
+        q.add_argument('--remote-host', default='127.0.0.1' if cmd == 'add' else None)
+        q.add_argument('--bind', choices=('127.0.0.1', '::1'), default='127.0.0.1' if cmd == 'add' else None)
+    q = sub.add_parser('logs', help='show recent diagnostics; rotated at 1 MiB, three backups')
+    q.add_argument('name')
+    q.add_argument('--lines', type=int, default=60)
+    return p
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    try:
+        if sys.platform != 'darwin':
+            raise Error('macOS is required for LaunchAgent management')
+        if os.getuid() == 0:
+            raise Error('Run as the logged-in user, without sudo')
+        m = Manager()
+        if a.command == '_run':
+            return runner(m, a.name)
+        # Serialize mutations and reads so edit/start cannot race one another.
+        with m.lock():
+            if a.command in ('add', 'edit'):
+                d = m.read(a.name) if a.command == 'edit' else {'schema': 1, 'name': a.name}
+                for key in ('ssh_host', 'local_port', 'remote_host', 'remote_port', 'bind'):
+                    if getattr(a, key) is not None:
+                        d[key] = getattr(a, key)
+                m.save(d, edit=a.command == 'edit')
+                print(a.name + ': saved; stopped until explicitly started')
+            elif a.command in ('list', 'status'):
+                names = [a.name] if a.name else m.names()
+                states = [m.status(n) for n in names]
+                if not names:
+                    print('No tunnels defined. Use lap-tunnel add --help.')
+                if a.command == 'status' and states and not all(states):
+                    return 1
+            elif a.command in ('start', 'restart'):
+                m.start(a.name, restart=a.command == 'restart')
+            elif a.command == 'stop':
+                m.stop(a.name)
+            elif a.command == 'remove':
+                m.remove(a.name)
+            elif a.command == 'show':
+                print(json.dumps(m.read(a.name), indent=2))
+            elif a.command == 'logs':
+                if not 1 <= a.lines <= 10000:
+                    raise Error('--lines must be in 1..10000')
+                path = m.log(a.name)
+                if not path.exists():
+                    print('No log yet; start the tunnel first.')
+                else:
+                    with path.open(errors='replace') as f:
+                        print(''.join(deque(f, maxlen=a.lines)), end='')
+            elif a.command == 'doctor':
+                d = m.read(a.name)
+                print('Python:', sys.executable, sys.version.split()[0])
+                print('LaunchAgent:', m.plist_path(a.name))
+                print('Definition:', m.definition(a.name))
+                print('Log:', m.log(a.name))
+                print('SSH argv:', json.dumps(ssh_args(d)))
+                # -G evaluates existing configuration locally; no network connection.
+                r = run('/usr/bin/ssh', '-G', *ssh_args(d)[1:], check=True)
+                selected = ('hostname ', 'user ', 'port ', 'identityfile ', 'stricthostkeychecking ', 'localforward ', 'remoteforward ', 'dynamicforward ', 'proxycommand ', 'proxyjump ')
+                print('\n'.join(line for line in r.stdout.splitlines() if line.startswith(selected)))
+                print('Review SSH config for extra forwards/ProxyCommand. Trust the host interactively first; then test: ssh -o BatchMode=yes -o StrictHostKeyChecking=yes HOST true')
+                print('Diagnostic output and logs can contain private hostnames/paths; redact before sharing.')
+        return 0
+    except (Error, OSError, ValueError, subprocess.SubprocessError) as e:
+        print('lap-tunnel: ' + str(e), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
