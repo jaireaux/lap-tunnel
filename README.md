@@ -5,9 +5,8 @@ once, keep it available after SSH failures, and stop it persistently when you
 no longer need it. No Terminal window, administrator privileges, daemon,
 third-party Python package, or private-key copying required.
 
-**Release candidate 0.1.0. License selection is pending the owner's decision.**
-No open-source license is granted until a LICENSE file is added. Do not treat
-this staging version as an open-source release.
+**Version 0.1.0 is an early prerelease, licensed under the [MIT License](LICENSE).**
+See the verification limits below before relying on it for unattended access.
 
 ## Requirements and support
 

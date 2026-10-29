@@ -13,7 +13,10 @@ Version: 0.1.0. Checked 2026-10-29 on macOS 26.6.2 / Python 3.14.6.
 - Socket binding in the development shell: denied by session policy
   (Operation not permitted). No live network forwarding test of v1 is claimed.
 - No reboot/login, logout/login or real sleep/wake check has been performed.
-- CI workflows are supplied; a green CI result must be checked separately.
+- Initial GitHub CI: macOS 15 with Python 3.11 and 3.14 passed. The macOS 14
+  jobs were cancelled after GitHub could not allocate runners; this was an
+  infrastructure failure, not a test failure. macOS 14 remains unverified.
+  Run: https://github.com/jaireaux/lap-tunnel/actions/runs/40919728969
 
 Before promoting broader compatibility claims, run the opt-in launchd test from
 an ordinary macOS GUI terminal. Then use an existing trusted SSH alias and an

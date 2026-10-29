@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — release candidate
+## 0.1.0 — prerelease
 
 - Generalized per-user macOS CLI and schema-validated private definitions.
 - Add/edit/show/remove, diagnostics and persistent lifecycle controls.
@@ -9,4 +9,4 @@
 - Bounded diagnostic logs and configuration/installation/recovery tests.
 - Separate namespace and explicit migration procedure for personal installations.
 
-License selection and final publication remain pending.
+- Released under the MIT License.

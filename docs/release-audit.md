@@ -14,7 +14,7 @@ addresses, reserved example.invalid and the illustrative dev-server alias
 are deliberate public examples. Automated scans supplement a manual read;
 no scan can prove absence of every possible secret.
 
-License selection remains outstanding. Keep this candidate private and its
-release in draft until the owner selects a license and the corresponding
-LICENSE/README/release wording is updated and audited again. Do not import
-private operational recovery records as part of publication.
+The owner selected the MIT License on 2026-10-29. LICENSE and public release
+wording were updated for publication; the complete reachable history and final
+source files were audited again. Private operational recovery records remain
+separate from the public source.
